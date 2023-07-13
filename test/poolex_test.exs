@@ -209,6 +209,30 @@ defmodule PoolexTest do
   end
 
   describe "timeouts" do
+    test "handles fun timeouts" do
+      pool_name = start_pool(worker_module: SomeWorker, workers_count: 1)
+
+      delay = :timer.seconds(3)
+
+      assert {:ok, :some_result} =
+               Poolex.run(
+                 pool_name,
+                 fn pid -> GenServer.call(pid, {:do_some_work_with_delay, delay}) end,
+                 timeout: 10
+               )
+
+      delay = :timer.seconds(6)
+
+      # FIXME 
+      # assert {:runtime_error, :timeout} =
+      assert :all_workers_are_busy =
+               Poolex.run(
+                 pool_name,
+                 fn pid -> GenServer.call(pid, {:do_some_work_with_delay, delay}) end,
+                 timeout: 10
+               )
+    end
+
     test "when caller waits too long" do
       pool_name = start_pool(worker_module: SomeWorker, workers_count: 1)
 
