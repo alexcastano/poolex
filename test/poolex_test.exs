@@ -209,28 +209,76 @@ defmodule PoolexTest do
   end
 
   describe "timeouts" do
-    test "handles fun timeouts" do
+    test "handles caller timeout" do
       pool_name = start_pool(worker_module: SomeWorker, workers_count: 1)
 
-      delay = :timer.seconds(3)
+      delay = 100
 
       assert {:ok, :some_result} =
-               Poolex.run(
-                 pool_name,
-                 fn pid -> GenServer.call(pid, {:do_some_work_with_delay, delay}) end,
-                 timeout: 10
-               )
+               Poolex.run(pool_name, fn pid ->
+                 GenServer.call(pid, {:do_some_work_with_delay, delay}, 1000)
+               end)
 
-      delay = :timer.seconds(6)
-
-      # FIXME 
+      # FIXME
       # assert {:runtime_error, :timeout} =
       assert :all_workers_are_busy =
-               Poolex.run(
-                 pool_name,
-                 fn pid -> GenServer.call(pid, {:do_some_work_with_delay, delay}) end,
-                 timeout: 10
-               )
+               Poolex.run(pool_name, fn pid ->
+                 GenServer.call(pid, {:do_some_work_with_delay, delay}, 1)
+               end)
+    end
+
+    test "handles checkout timeout" do
+      test_pid = self()
+      pool_name = start_pool(worker_module: SomeWorker, workers_count: 1)
+
+      delay = 100
+
+      process_1 =
+        spawn(fn ->
+          assert {:ok, :some_result} =
+                   Poolex.run(pool_name, fn pid ->
+                     send(test_pid, {:worker, pid})
+                     GenServer.call(pid, {:do_some_work_with_delay, delay})
+                   end)
+        end)
+
+      ref_1 = Process.monitor(process_1)
+
+      process_2 =
+        spawn(fn ->
+          # FIXME
+          # assert {:error, :checkout_timeout} =
+          assert :all_workers_are_busy =
+                   Poolex.run(
+                     pool_name,
+                     fn pid ->
+                       GenServer.call(pid, {:do_some_work_with_delay, delay})
+                     end,
+                     timeout: 0
+                   )
+
+          send(test_pid, {:waiting, self()})
+
+          receive do
+            :finish -> :ok
+          end
+        end)
+
+      ref_2 = Process.monitor(process_2)
+
+      assert_receive {:worker, worker}, 1000
+      assert_receive {:waiting, ^process_2}, 1000
+      assert_receive {:DOWN, ^ref_1, :process, ^process_1, _}, 1000
+      refute_received _
+
+      Process.sleep(100)
+      debug_info = Poolex.get_debug_info(pool_name)
+      # FIXME!
+      # assert %{busy_workers_pids: []} = debug_info
+      assert %{busy_workers_pids: [^worker]} = debug_info
+
+      send(process_2, :finish)
+      assert_receive {:DOWN, ^ref_2, :process, ^process_2, _}
     end
 
     test "when caller waits too long" do
