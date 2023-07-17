@@ -19,7 +19,7 @@ defmodule Poolex do
   Then you can execute any code on the workers with `run/3`:
 
   ```elixir
-  Poolex.run(:worker_pool, &(is_pid?(&1)), timeout: 1_000)
+  Poolex.run(:worker_pool, &(is_pid?(&1)), checkout_timeout: 1_000)
   {:ok, true}
   ```
 
@@ -85,9 +85,9 @@ defmodule Poolex do
   @typedoc """
   | Option  | Description                                        | Example  | Default value              |
   |---------|----------------------------------------------------|----------|----------------------------|
-  | timeout | How long we can wait for a worker on the call site | `60_000` | `#{@default_wait_timeout}` |
+  | checkout_timeout | How long we can wait for a worker on the call site | `60_000` | `#{@default_wait_timeout}` |
   """
-  @type run_option() :: {:timeout, timeout()}
+  @type run_option() :: {:checkout_timeout, timeout()}
 
   @doc """
   Starts a Poolex process without links (outside of a supervision tree).
@@ -166,20 +166,21 @@ defmodule Poolex do
   ## Examples
 
       iex> Poolex.start_link(pool_id: :some_pool, worker_module: Agent, worker_args: [fn -> 5 end], workers_count: 1)
-      iex> Poolex.run(:some_pool, fn _pid -> raise RuntimeError end)
-      {:runtime_error, %RuntimeError{message: "runtime error"}}
       iex> Poolex.run(:some_pool, fn pid -> Agent.get(pid, &(&1)) end)
       {:ok, 5}
   """
   @spec run(pool_id(), (worker :: pid() -> any()), list(run_option())) ::
-          {:ok, any()} | :all_workers_are_busy | {:runtime_error, any()}
+          {:ok, any()} | {:error, :checkout_timeout}
   def run(pool_id, fun, options \\ []) do
-    {:ok, run!(pool_id, fun, options)}
-  rescue
-    runtime_error -> {:runtime_error, runtime_error}
-  catch
-    :exit, {:timeout, _meta} -> :all_workers_are_busy
-    :exit, reason -> {:runtime_error, reason}
+    checkout_timeout = Keyword.get(options, :checkout_timeout, @default_wait_timeout)
+
+    with {:ok, pid} <- checkout(pool_id, checkout_timeout) do
+      try do
+        {:ok, fun.(pid)}
+      after
+        checkin(pool_id, pid)
+      end
+    end
   end
 
   @doc """
@@ -196,15 +197,27 @@ defmodule Poolex do
   """
   @spec run!(pool_id(), (worker :: pid() -> any()), list(run_option())) :: any()
   def run!(pool_id, fun, options \\ []) do
-    timeout = Keyword.get(options, :timeout, @default_wait_timeout)
+    case run(pool_id, fun, options) do
+      {:ok, value} -> value
+      # FIXME We should create a custom error
+      {:error, :checkout_timeout} -> raise "Checkout timeout!"
+    end
+  end
 
-    {:ok, pid} = GenServer.call(pool_id, :get_idle_worker, timeout)
+  def checkout(pool_id, timeout \\ 5000) do
+    ref = make_ref()
 
     try do
-      fun.(pid)
-    after
-      GenServer.cast(pool_id, {:release_busy_worker, pid})
+      GenServer.call(pool_id, {:checkout, ref}, timeout)
+    catch
+      :exit, {:timeout, {GenServer, :call, [_, {:checkout, ^ref}, _]}} ->
+        GenServer.cast(pool_id, {:cancel_checkin, ref})
+        {:error, :checkout_timeout}
     end
+  end
+
+  def checkin(pool_id, pid) do
+    GenServer.cast(pool_id, {:checkin, pid})
   end
 
   @doc """
@@ -311,7 +324,7 @@ defmodule Poolex do
   defp start_workers(workers_count, state, monitor_id) do
     Enum.map(1..workers_count, fn _ ->
       {:ok, worker_pid} = start_worker(state)
-      Monitoring.add(monitor_id, worker_pid, :worker)
+      Monitoring.add(monitor_id, nil, worker_pid, :worker)
 
       worker_pid
     end)
@@ -331,12 +344,12 @@ defmodule Poolex do
   end
 
   @impl GenServer
-  def handle_call(:get_idle_worker, {from_pid, _} = caller, %State{} = state) do
+  def handle_call({:checkout, cancel_ref}, {from_pid, _} = caller, %State{} = state) do
     if IdleWorkers.empty?(state.idle_workers_impl, state.idle_workers_state) do
       if state.overflow < state.max_overflow do
         {:ok, new_worker} = start_worker(state)
 
-        Monitoring.add(state.monitor_id, new_worker, :temporary_worker)
+        Monitoring.add(state.monitor_id, nil, new_worker, :temporary_worker)
 
         new_state = %State{
           state
@@ -347,7 +360,7 @@ defmodule Poolex do
 
         {:reply, {:ok, new_worker}, new_state}
       else
-        Monitoring.add(state.monitor_id, from_pid, :caller)
+        Monitoring.add(state.monitor_id, cancel_ref, from_pid, :caller)
 
         new_callers_state =
           WaitingCallers.add(state.waiting_callers_impl, state.waiting_callers_state, caller)
@@ -397,7 +410,7 @@ defmodule Poolex do
   end
 
   @impl GenServer
-  def handle_cast({:release_busy_worker, worker}, %State{} = state) do
+  def handle_cast({:checkin, worker}, %State{} = state) do
     if WaitingCallers.empty?(state.waiting_callers_impl, state.waiting_callers_state) do
       new_state = release_busy_worker(state, worker)
       {:noreply, new_state}
@@ -405,6 +418,23 @@ defmodule Poolex do
       new_state = provide_worker_to_waiting_caller(state, worker)
       {:noreply, new_state}
     end
+  end
+
+  def handle_cast({:cancel_checkin, cancel_ref}, %State{} = state) do
+    state =
+      if pid = Monitoring.cancel(state.monitor_id, cancel_ref) do
+        handle_checkin(pid, state)
+        IO.puts("Canceled")
+      else
+        state
+      end
+
+    {:noreply, state}
+  end
+
+  defp handle_checkin(_pid, state) do
+    # TODO
+    state
   end
 
   @spec release_busy_worker(State.t(), worker()) :: State.t()
@@ -462,7 +492,7 @@ defmodule Poolex do
       :worker ->
         {:ok, new_worker} = start_worker(state)
 
-        Monitoring.add(state.monitor_id, new_worker, :worker)
+        Monitoring.add(state.monitor_id, nil, new_worker, :worker)
 
         temp_idle_workers_state =
           IdleWorkers.remove(state.idle_workers_impl, state.idle_workers_state, dead_process_pid)

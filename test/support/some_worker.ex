@@ -10,6 +10,14 @@ defmodule SomeWorker do
     GenServer.start_link(__MODULE__, [])
   end
 
+  def short_task(pid) do
+    GenServer.call(pid, :do_some_work)
+  end
+
+  def long_task(pid, delay \\ :timer.seconds(4), timeout \\ :timer.seconds(5)) do
+    GenServer.call(pid, {:do_some_work_with_delay, delay}, timeout)
+  end
+
   @impl true
   def init(_options) do
     {:ok, :ok}
